@@ -78,6 +78,10 @@ pub struct DocMapper {
     timestamp_field_path: Option<Vec<String>>,
     /// Secondary timestamp field name.
     secondary_timestamp_field_name: Option<String>,
+    /// Indexation time field name.
+    indexation_time_field_name: Option<String>,
+    /// Indexation time field path (name parsed)
+    indexation_time_field_path: Option<Vec<String>>,
     /// Root node of the field mapping tree.
     /// See [`MappingNode`].
     field_mappings: MappingNode,
@@ -142,6 +146,7 @@ impl From<DocMapper> for DocMapperBuilder {
             field_mappings: default_doc_mapper.field_mappings.into(),
             timestamp_field: default_doc_mapper.timestamp_field_name,
             secondary_timestamp_field: default_doc_mapper.secondary_timestamp_field_name,
+            indexation_time_field: default_doc_mapper.indexation_time_field_name,
             tag_fields: default_doc_mapper.tag_field_names,
             partition_key: partition_key_opt,
             max_num_partitions: default_doc_mapper.max_num_partitions,
@@ -203,6 +208,10 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
         } else {
             None
         };
+        let indexation_time_field_path = doc_mapping
+            .indexation_time_field
+            .as_ref()
+            .map(|f| build_field_path_from_str(f));
         let schema = schema_builder.build();
 
         let tokenizer_manager = create_default_quickwit_tokenizer_manager();
@@ -293,6 +302,8 @@ impl TryFrom<DocMapperBuilder> for DocMapper {
             timestamp_field_name: doc_mapping.timestamp_field,
             timestamp_field_path,
             secondary_timestamp_field_name: doc_mapping.secondary_timestamp_field,
+            indexation_time_field_name: doc_mapping.indexation_time_field,
+            indexation_time_field_path,
             field_mappings,
             concatenate_dynamic_fields,
             tag_field_names,
@@ -679,6 +690,11 @@ impl DocMapper {
     /// Returns the secondary timestamp field name.
     pub fn secondary_timestamp_field_name(&self) -> Option<&str> {
         self.secondary_timestamp_field_name.as_deref()
+    }
+
+    /// Returns the indexation time field path.
+    pub fn indexation_time_field_path(&self) -> Option<&[String]> {
+        self.indexation_time_field_path.as_deref()
     }
 
     /// Returns the tag `NameField`s on the current schema.

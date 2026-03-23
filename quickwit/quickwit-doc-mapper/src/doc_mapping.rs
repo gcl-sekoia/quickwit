@@ -133,6 +133,11 @@ pub struct DocMapping {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub secondary_timestamp_field: Option<String>,
 
+    /// Declares the field which will contain the indexation time for the document.
+    #[serde(default)]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub indexation_time_field: Option<String>,
+
     /// Declares the low cardinality fields for which the values ​​are recorded directly in the
     /// splits metadata.
     #[schema(value_type = Vec<String>)]
@@ -207,6 +212,7 @@ mod tests {
             ],
             timestamp_field: Some("timestamp".to_string()),
             secondary_timestamp_field: None,
+            indexation_time_field: None,
             tag_fields: BTreeSet::from_iter(["level".to_string()]),
             partition_key: Some("tenant_id".to_string()),
             max_num_partitions: NonZeroU32::new(100).unwrap(),

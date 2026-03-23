@@ -35,6 +35,8 @@ use serde_json::Value as JsonValue;
 use tantivy::schema::{Field, Value};
 use tantivy::{DateTime, TantivyDocument};
 use thiserror::Error;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 use tokio::runtime::Handle;
 
 #[cfg(feature = "vrl")]
@@ -407,6 +409,7 @@ pub struct DocProcessor {
     doc_mapper: Arc<DocMapper>,
     indexer_mailbox: Mailbox<Indexer>,
     timestamp_field_opt: Option<Field>,
+    indexation_time_field_path: Option<Box<[String]>>,
     counters: Arc<DocProcessorCounters>,
     publish_lock: PublishLock,
     #[cfg(feature = "vrl")]
@@ -424,6 +427,7 @@ impl DocProcessor {
         input_format: SourceInputFormat,
     ) -> anyhow::Result<Self> {
         let timestamp_field_opt = extract_timestamp_field(&doc_mapper)?;
+        let indexation_time_field_path = doc_mapper.indexation_time_field_path().map(Box::from);
         if cfg!(not(feature = "vrl")) && transform_config_opt.is_some() {
             bail!("VRL is not enabled: please recompile with the `vrl` feature")
         }
@@ -431,6 +435,7 @@ impl DocProcessor {
             doc_mapper,
             indexer_mailbox,
             timestamp_field_opt,
+            indexation_time_field_path,
             counters: Arc::new(DocProcessorCounters::new(index_id, source_id)),
             publish_lock: PublishLock::default(),
             #[cfg(feature = "vrl")]
@@ -461,7 +466,12 @@ impl DocProcessor {
         Ok(Some(timestamp))
     }
 
-    fn process_raw_doc(&mut self, raw_doc: Bytes, processed_docs: &mut Vec<ProcessedDoc>) {
+    fn process_raw_doc(
+        &mut self,
+        raw_doc: Bytes,
+        indexation_time_opt: Option<&str>,
+        processed_docs: &mut Vec<ProcessedDoc>,
+    ) {
         let num_bytes = raw_doc.len();
 
         #[cfg(feature = "vrl")]
@@ -470,8 +480,8 @@ impl DocProcessor {
         let transform_opt: Option<&mut VrlProgram> = None;
 
         for json_doc_result in parse_raw_doc(self.input_format, raw_doc, num_bytes, transform_opt) {
-            let processed_doc_result =
-                json_doc_result.and_then(|json_doc| self.process_json_doc(json_doc));
+            let processed_doc_result = json_doc_result
+                .and_then(|json_doc| self.process_json_doc(json_doc, indexation_time_opt));
 
             match processed_doc_result {
                 Ok(processed_doc) => {
@@ -491,8 +501,24 @@ impl DocProcessor {
         }
     }
 
-    fn process_json_doc(&self, json_doc: JsonDoc) -> Result<ProcessedDoc, DocProcessorError> {
+    fn process_json_doc(
+        &self,
+        mut json_doc: JsonDoc,
+        indexation_time_opt: Option<&str>,
+    ) -> Result<ProcessedDoc, DocProcessorError> {
         let num_bytes = json_doc.num_bytes;
+
+        // Inject the indexation time into the document under the configured field path.
+        if let (Some(path), Some(indexation_time)) = (
+            self.indexation_time_field_path.as_deref(),
+            indexation_time_opt,
+        ) {
+            inject_field_path(
+                &mut json_doc.json_obj,
+                path,
+                JsonValue::String(indexation_time.to_string()),
+            );
+        }
 
         let (partition, doc) = self
             .doc_mapper
@@ -516,6 +542,27 @@ fn extract_timestamp_field(doc_mapper: &DocMapper) -> anyhow::Result<Option<Fiel
         .get_field(timestamp_field_name)
         .context("failed to find timestamp field in schema")?;
     Ok(Some(timestamp_field))
+}
+
+/// Injects `value` into `json_obj` at the location described by the pre-split `path` segments.
+///
+/// Intermediate segments that don't yet exist are created as empty objects. If an intermediate
+/// segment already exists but is not a JSON object, the injection is silently skipped.
+fn inject_field_path(json_obj: &mut JsonObject, path: &[String], value: JsonValue) {
+    let Some((last_segment, parent_segments)) = path.split_last() else {
+        return;
+    };
+    let mut current = json_obj;
+    for segment in parent_segments {
+        let nested = current
+            .entry(segment.clone())
+            .or_insert_with(|| JsonValue::Object(serde_json::Map::new()));
+        let JsonValue::Object(nested_map) = nested else {
+            return;
+        };
+        current = nested_map;
+    }
+    current.insert(last_segment.clone(), value);
 }
 
 #[cfg(not(feature = "vrl"))]
@@ -572,11 +619,16 @@ impl Handler<RawDocBatch> for DocProcessor {
         if self.publish_lock.is_dead() {
             return Ok(());
         }
+        let indexation_time_opt = self.indexation_time_field_path.as_deref().map(|_| {
+            OffsetDateTime::now_utc()
+                .format(&Rfc3339)
+                .expect("Failed to format indexation time as RFC 3339")
+        });
         let mut processed_docs: Vec<ProcessedDoc> = Vec::with_capacity(raw_doc_batch.docs.len());
 
         for raw_doc in raw_doc_batch.docs {
             let _protected_zone_guard = ctx.protect_zone();
-            self.process_raw_doc(raw_doc, &mut processed_docs);
+            self.process_raw_doc(raw_doc, indexation_time_opt.as_deref(), &mut processed_docs);
             ctx.record_progress();
         }
         let processed_doc_batch = ProcessedDocBatch::new(
@@ -644,12 +696,63 @@ mod tests {
     use super::*;
     use crate::models::{PublishLock, RawDocBatch};
 
+    /// Returns a `DocMapper` identical to `default_doc_mapper_for_test()` but with
+    /// `indexation_time_field` set.
+    fn doc_mapper_with_indexation_time_for_test() -> DocMapper {
+        const JSON_CONFIG_VALUE: &str = r#"
+        {
+            "store_source": true,
+            "index_field_presence": true,
+            "default_search_fields": [
+                "body", "attributes.server", "attributes.server\\.status"
+            ],
+            "timestamp_field": "timestamp",
+            "indexation_time_field": "meta.indexation_time",
+            "tag_fields": ["owner"],
+            "field_mappings": [
+                { "name": "timestamp", "type": "datetime", "output_format": "unix_timestamp_secs", "fast": true },
+                { "name": "body", "type": "text", "stored": true },
+                { "name": "response_date", "type": "datetime", "input_formats": ["rfc3339", "unix_timestamp"], "fast": true },
+                { "name": "response_time", "type": "f64", "fast": true },
+                { "name": "response_payload", "type": "bytes", "fast": true },
+                { "name": "owner", "type": "text", "tokenizer": "raw" },
+                { "name": "isImportant", "type": "bool" },
+                { "name": "properties", "type": "json" },
+                { "name": "children", "type": "array<json>" },
+                {
+                    "name": "attributes",
+                    "type": "object",
+                    "field_mappings": [
+                        { "name": "tags", "type": "array<i64>" },
+                        { "name": "server", "type": "text" },
+                        { "name": "server.status", "type": "array<text>" },
+                        { "name": "server.payload", "type": "array<bytes>" }
+                    ]
+                }
+            ]
+        }"#;
+        serde_json::from_str::<DocMapper>(JSON_CONFIG_VALUE).unwrap()
+    }
+
+    /// Extracts the `meta.indexation_time` value from a JSON document and validates
+    /// it is a valid RFC 3339 datetime string.
+    fn extract_and_validate_indexation_time(doc_json: &JsonValue) -> String {
+        let indexation_time = doc_json
+            .get("meta")
+            .and_then(|v| v.get("indexation_time"))
+            .and_then(|v| v.as_str())
+            .expect("missing meta.indexation_time in document");
+        OffsetDateTime::parse(indexation_time, &Rfc3339)
+            .expect("meta.indexation_time is not a valid RFC 3339 datetime");
+        indexation_time.to_string()
+    }
+
     #[tokio::test]
     async fn test_doc_processor_simple() {
         let index_id = "my-index";
         let source_id = "my-source";
         let universe = Universe::with_accelerated_time();
-        let doc_mapper = Arc::new(default_doc_mapper_for_test());
+        let doc_mapper = Arc::new(doc_mapper_with_indexation_time_for_test());
         let (indexer_mailbox, indexer_inbox) = universe.create_test_mailbox();
         let doc_processor = DocProcessor::try_new(
             index_id.to_string(),
@@ -702,6 +805,7 @@ mod tests {
         let schema = doc_mapper.schema();
         let NamedFieldDocument(named_field_doc_map) = batch.docs[0].doc.to_named_doc(&schema);
         let doc_json = JsonValue::Object(doc_mapper.doc_to_json(named_field_doc_map).unwrap());
+        let indexation_time = extract_and_validate_indexation_time(&doc_json);
         assert_eq!(
             doc_json,
             serde_json::json!({
@@ -710,15 +814,27 @@ mod tests {
                     "response_date": "2021-12-19T16:39:59Z",
                     "response_payload": "YWJj",
                     "response_time": 2,
+                    "meta": { "indexation_time": indexation_time },
                     "timestamp": 1628837062
                 },
                 "body": "happy",
                 "response_date": "2021-12-19T16:39:59Z",
                 "response_payload": "YWJj",
                 "response_time": 2.0,
+                "meta": { "indexation_time": indexation_time },
                 "timestamp": 1628837062
             })
         );
+
+        // Verify all docs in the batch share the same indexation time.
+        let NamedFieldDocument(named_field_doc_map_1) = batch.docs[1].doc.to_named_doc(&schema);
+        let doc_json_1 = JsonValue::Object(doc_mapper.doc_to_json(named_field_doc_map_1).unwrap());
+        let indexation_time_1 = extract_and_validate_indexation_time(&doc_json_1);
+        assert_eq!(
+            indexation_time, indexation_time_1,
+            "all docs in a batch must share the same indexation time"
+        );
+
         universe.assert_quit().await;
     }
 
@@ -1164,12 +1280,64 @@ mod tests {
 #[cfg(test)]
 mod tests_vrl {
     use quickwit_actors::Universe;
-    use quickwit_doc_mapper::default_doc_mapper_for_test;
+    use quickwit_doc_mapper::DocMapper;
     use quickwit_metastore::checkpoint::SourceCheckpointDelta;
+    use serde_json::Value as JsonValue;
     use tantivy::Document;
     use tantivy::schema::NamedFieldDocument;
 
     use super::*;
+
+    /// Extracts the `meta.indexation_time` value from a JSON document and validates
+    /// it is a valid RFC 3339 datetime string.
+    fn extract_and_validate_indexation_time(doc_json: &JsonValue) -> String {
+        let indexation_time = doc_json
+            .get("meta")
+            .and_then(|v| v.get("indexation_time"))
+            .and_then(|v| v.as_str())
+            .expect("missing meta.indexation_time in document");
+        OffsetDateTime::parse(indexation_time, &Rfc3339)
+            .expect("meta.indexation_time is not a valid RFC 3339 datetime");
+        indexation_time.to_string()
+    }
+
+    /// Returns a `DocMapper` identical to `default_doc_mapper_for_test()` but with
+    /// `indexation_time_field` set to `"meta.indexation_time"`.
+    fn doc_mapper_with_indexation_time_for_test() -> DocMapper {
+        const JSON_CONFIG_VALUE: &str = r#"
+        {
+            "store_source": true,
+            "index_field_presence": true,
+            "default_search_fields": [
+                "body", "attributes.server", "attributes.server\\.status"
+            ],
+            "timestamp_field": "timestamp",
+            "indexation_time_field": "meta.indexation_time",
+            "tag_fields": ["owner"],
+            "field_mappings": [
+                { "name": "timestamp", "type": "datetime", "output_format": "unix_timestamp_secs", "fast": true },
+                { "name": "body", "type": "text", "stored": true },
+                { "name": "response_date", "type": "datetime", "input_formats": ["rfc3339", "unix_timestamp"], "fast": true },
+                { "name": "response_time", "type": "f64", "fast": true },
+                { "name": "response_payload", "type": "bytes", "fast": true },
+                { "name": "owner", "type": "text", "tokenizer": "raw" },
+                { "name": "isImportant", "type": "bool" },
+                { "name": "properties", "type": "json" },
+                { "name": "children", "type": "array<json>" },
+                {
+                    "name": "attributes",
+                    "type": "object",
+                    "field_mappings": [
+                        { "name": "tags", "type": "array<i64>" },
+                        { "name": "server", "type": "text" },
+                        { "name": "server.status", "type": "array<text>" },
+                        { "name": "server.payload", "type": "array<bytes>" }
+                    ]
+                }
+            ]
+        }"#;
+        serde_json::from_str::<DocMapper>(JSON_CONFIG_VALUE).unwrap()
+    }
 
     #[tokio::test]
     async fn test_doc_processor_simple_vrl() -> anyhow::Result<()> {
@@ -1177,7 +1345,7 @@ mod tests_vrl {
         let source_id = "my-source";
         let universe = Universe::with_accelerated_time();
         let (indexer_mailbox, indexer_inbox) = universe.create_test_mailbox();
-        let doc_mapper = Arc::new(default_doc_mapper_for_test());
+        let doc_mapper = Arc::new(doc_mapper_with_indexation_time_for_test());
         let transform_config = TransformConfig::for_test(".body = upcase(string!(.body))");
         let doc_processor = DocProcessor::try_new(
             index_id.to_string(),
@@ -1231,6 +1399,7 @@ mod tests_vrl {
         let schema = doc_mapper.schema();
         let NamedFieldDocument(named_field_doc_map) = batch.docs[0].doc.to_named_doc(&schema);
         let doc_json = JsonValue::Object(doc_mapper.doc_to_json(named_field_doc_map)?);
+        let indexation_time = extract_and_validate_indexation_time(&doc_json);
         assert_eq!(
             doc_json,
             serde_json::json!({
@@ -1239,12 +1408,14 @@ mod tests_vrl {
                     "response_date": "2021-12-19T16:39:59Z",
                     "response_payload": "YWJj",
                     "response_time": 2,
+                    "meta": { "indexation_time": indexation_time },
                     "timestamp": 1628837062
                 },
                 "body": "HAPPY USING VRL",
                 "response_date": "2021-12-19T16:39:59Z",
                  "response_payload": "YWJj",
                  "response_time": 2.0,
+                 "meta": { "indexation_time": indexation_time },
                  "timestamp": 1628837062
             })
         );
@@ -1258,7 +1429,7 @@ mod tests_vrl {
         let source_id = "my-source";
         let universe = Universe::with_accelerated_time();
         let (indexer_mailbox, indexer_inbox) = universe.create_test_mailbox();
-        let doc_mapper = Arc::new(default_doc_mapper_for_test());
+        let doc_mapper = Arc::new(doc_mapper_with_indexation_time_for_test());
         let vrl_script = r#"
             values = parse_csv!(.plain_text)
             .body = upcase(string!(values[0]))
@@ -1321,6 +1492,7 @@ mod tests_vrl {
         let schema = doc_mapper.schema();
         let NamedFieldDocument(named_field_doc_map) = batch.docs[0].doc.to_named_doc(&schema);
         let doc_json = JsonValue::Object(doc_mapper.doc_to_json(named_field_doc_map).unwrap());
+        let indexation_time = extract_and_validate_indexation_time(&doc_json);
         assert_eq!(
             doc_json,
             serde_json::json!({
@@ -1329,12 +1501,14 @@ mod tests_vrl {
                     "response_date": "2021-12-19T16:39:59Z",
                     "response_payload": "YWJj",
                     "response_time": 2,
+                    "meta": { "indexation_time": indexation_time },
                     "timestamp": 1628837062
                 },
                 "body": "HAPPY USING VRL",
                 "response_date": "2021-12-19T16:39:59Z",
                 "response_payload": "YWJj",
                 "response_time": 2.0,
+                "meta": { "indexation_time": indexation_time },
                 "timestamp": 1628837062
             })
         );
